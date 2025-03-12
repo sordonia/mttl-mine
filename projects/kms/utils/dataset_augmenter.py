@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass
+from hashlib import md5
 from typing import Dict, List, Union
 
 import click
@@ -10,6 +11,7 @@ import torch
 import tqdm
 import vllm
 from datasets import Dataset, DatasetDict, DatasetInfo, load_dataset
+from openai import APIConnectionError, AsyncAzureOpenAI, RateLimitError
 from tqdm import tqdm as ttqdm
 from tqdm.asyncio import tqdm as tqdm_async
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -31,42 +33,128 @@ class OAIGeneration:
     text: str = None
 
 
+def compute_args_hash(*args):
+    return md5(str(args).encode()).hexdigest()
+
+
+def write_json(json_obj, file_name):
+    with open(file_name, "w", encoding="utf-8") as f:
+        json.dump(json_obj, f, indent=2, ensure_ascii=False)
+
+
+def load_json(file_name):
+    if not os.path.exists(file_name):
+        return None
+    with open(file_name, encoding="utf-8") as f:
+        return json.load(f)
+
+
+@dataclass
+class JsonKVStorage:
+    namespace: str = None
+    working_dir: str = None
+
+    def __post_init__(self):
+        os.makedirs(self.working_dir, exist_ok=True)
+        self._file_name = os.path.join(
+            self.working_dir, f"kv_store_{self.namespace}.json"
+        )
+        self._data = load_json(self._file_name) or {}
+
+    async def all_keys(self) -> list[str]:
+        return list(self._data.keys())
+
+    async def index_done_callback(self):
+        write_json(self._data, self._file_name)
+
+    async def get_by_id(self, id):
+        return self._data.get(id, None)
+
+    async def get_by_ids(self, ids, fields=None):
+        if fields is None:
+            return [self._data.get(id, None) for id in ids]
+        return [
+            (
+                {k: v for k, v in self._data[id].items() if k in fields}
+                if self._data.get(id, None)
+                else None
+            )
+            for id in ids
+        ]
+
+    async def filter_keys(self, data: list[str]) -> set[str]:
+        return set([s for s in data if s not in self._data])
+
+    async def upsert(self, data: dict[str, dict]):
+        self._data.update(data)
+
+    async def drop(self):
+        self._data = {}
+
+
 @tenacity.retry(
-    wait=tenacity.wait_random_exponential(min=10, max=60),
-    stop=tenacity.stop_after_attempt(100),
+    stop=tenacity.stop_after_attempt(3),
+    wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
+    retry=tenacity.retry_if_exception_type((RateLimitError, APIConnectionError)),
 )
-async def oai_get_completions(
-    prompt, model, num_completions=1, top_p=0.8, max_tokens=768
-):
+async def azure_openai_complete(
+    prompt,
+    model,
+    num_completions=1,
+    top_p=0.8,
+    max_tokens=768,
+    hashing_kv=None,
+) -> str:
+    messages = []
+    messages.append({"role": "user", "content": prompt})
+
+    if hashing_kv is not None:
+        args_hash = compute_args_hash(model, messages)
+        if_cache_return = await hashing_kv.get_by_id(args_hash)
+        if if_cache_return is not None:
+            output = OAIGenerations(
+                outputs=[OAIGeneration(text=r) for r in if_cache_return["return"]]
+            )
+            return output
+
     response = await client.chat.completions.create(
         model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
+        messages=messages,
+        n=num_completions,
         top_p=top_p,
         max_tokens=max_tokens,
-        n=num_completions,
     )
-    # make the results to be in the same format as VLLM
-    return OAIGenerations(
+    output = OAIGenerations(
         outputs=[
             OAIGeneration(text=choice.message.content) for choice in response.choices
         ]
     )
+    if hashing_kv is not None:
+        await hashing_kv.upsert(
+            {
+                args_hash: {
+                    "return": [gen.text for gen in output.outputs],
+                    "model": model,
+                }
+            }
+        )
+        await hashing_kv.index_done_callback()
+
+    # make the results to be in the same format as VLLM
+    return output
 
 
 async def oai_get_completions_batched(
-    prompts, model, num_completions, top_p, max_tokens
+    prompts, model, num_completions, top_p, max_tokens, hashing_kv=None
 ):
     results = []
     for i in range(0, len(prompts), 100):
         batch_prompts = prompts[i : i + 100]
         batch = await tqdm_async.gather(
             *[
-                oai_get_completions(p, model, num_completions, top_p, max_tokens)
+                azure_openai_complete(
+                    p, model, num_completions, top_p, max_tokens, hashing_kv
+                )
                 for p in batch_prompts
             ]
         )
@@ -98,6 +186,48 @@ def chunk_text(
     chunks = text_splitter.split_text(text)
     for chunk in chunks:
         yield chunk
+
+
+def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
+    try:
+        # If there is already an event loop, use it.
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop
+
+
+class OAILLM:
+    def __init__(self, model_name):
+        from azure.identity import AzureCliCredential, get_bearer_token_provider
+
+        global client
+
+        self.model = model_name
+        self.hashing_kv = JsonKVStorage(namespace="oai", working_dir="oai-cache/")
+        client = AsyncAzureOpenAI(
+            azure_ad_token_provider=get_bearer_token_provider(
+                AzureCliCredential(), os.environ["OPENAI_SCOPE"]
+            ),
+            azure_endpoint=os.environ.get("OPENAI_BASE_URL"),
+            api_version=os.environ.get("OPENAI_API_VERSION"),
+        )
+
+    def generate(self, prompts, sampling_params):
+        # Generate completions using the OpenAI API
+        loop = always_get_an_event_loop()
+        results = loop.run_until_complete(
+            oai_get_completions_batched(
+                prompts,
+                self.model,
+                num_completions=sampling_params["num_completions"],
+                top_p=sampling_params["top_p"],
+                max_tokens=sampling_params["max_tokens"],
+                hashing_kv=self.hashing_kv,
+            )
+        )
+        return results
 
 
 class GenerationTask(Registrable):
@@ -405,26 +535,10 @@ class DatasetAugmenter:
                 f"DatasetAugmenter: Setting max_model_len to {self.tokenizer.model_max_length}."
             )
         else:
-            from openai import AsyncAzureOpenAI, AsyncOpenAI, OpenAI
-
-            global client
-
-            if model_type == "oai":
-                client = AsyncOpenAI(
-                    api_key=os.environ.get("OPENAI_API_KEY"),
-                    base_url=os.environ.get("OPENAI_BASE_URL"),
-                )
-            else:
-                client = AsyncAzureOpenAI(
-                    api_key=os.environ.get("OPENAI_API_KEY"),
-                    azure_endpoint=os.environ.get("OPENAI_BASE_URL"),
-                    api_version=os.environ.get("OPENAI_API_VERSION"),
-                )
-
+            self.llm = OAILLM(self.model)
             self.tokenizer = AutoTokenizer.from_pretrained(
                 "microsoft/Phi-3-medium-4k-instruct"
             )
-            self.llm = None
 
     def add_task(self, task):
         task_gen = GenerationTask.get_class_by_name(task)(self.tokenizer)
@@ -446,18 +560,7 @@ class DatasetAugmenter:
                     prompts.append(prompt)
                     indices.append(i)
 
-        if not self.oai:
-            outputs = self.llm.generate(prompts, self.sampling_params)
-        else:
-            outputs = asyncio.run(
-                oai_get_completions_batched(
-                    prompts,
-                    self.model,
-                    num_completions=1,
-                    top_p=self.generation_top_p,
-                    max_tokens=self.max_continuation_length,
-                )
-            )
+        outputs = self.llm.generate(prompts, self.sampling_params)
 
         scores = [[] for _ in range(len(dataset))]
         for index, generation_output in zip(indices, outputs):
@@ -506,7 +609,7 @@ class DatasetAugmenter:
                 "top_p": self.generation_top_p,
                 "max_tokens": self.max_continuation_length,
             }
-            results = task.process(
+            results = task.process_task(
                 chunks,
                 rests,
                 self.tokenizer,
