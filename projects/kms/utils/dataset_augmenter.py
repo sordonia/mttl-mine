@@ -599,6 +599,9 @@ class DatasetAugmenter:
                 rests.append(rest)
 
         # Process each task separately
+        print("Number of chunks: ", len(chunks))
+        print("Number of tasks: ", len(self.tasks))
+
         output_dataset = []
         for task_name, task in tqdm.tqdm(self.tasks.items(), desc="Processing tasks"):
             logger.info(f"Processing task: {task_name}")
