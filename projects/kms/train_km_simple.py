@@ -18,11 +18,16 @@ from projects.kms.utils.wiki_mmlu_datamodule import WikiMMLUDataModule
 from mttl.arguments import ExpertConfig
 from mttl.datamodule.base import get_datamodule
 from mttl.dist_utils import (
+    fsdp_load_model,
+    fsdp_save_model,
+    get_default_fsdp_config,
     get_device,
     get_local_rank,
+    get_lora_ignored_fsdp_config,
     is_dist_avail_and_initialized,
     is_main_process,
     seed_everything,
+    wrap_model_with_fsdp,
 )
 from mttl.logging import logger, setup_logging
 from mttl.models.expert_model import ExpertModel, ExpertModelConfig
@@ -141,6 +146,8 @@ class KMArguments(ExpertConfig):
     eval_after_training: bool = True
     patience: int = None
     overwrite_output_dir: bool = False
+    fsdp: bool = False
+    fsdp_config: dict = None
 
 
 def train_km(training_args: KMArguments):
@@ -170,6 +177,7 @@ def train_km(training_args: KMArguments):
         load_in_8bit=training_args.load_in_8bit,
         device_map=training_args.device_map,
         attn_implementation=training_args.attn_implementation,
+        precision=training_args.precision,
     ).to(device)
 
     # deactivate use_cache for Phi
@@ -177,8 +185,17 @@ def train_km(training_args: KMArguments):
         model.model.config.use_cache = False
 
     if is_dist_avail_and_initialized():
-        model = DDP(model, device_ids=[get_local_rank()])
+        if training_args.fsdp:
+            # Use our custom config that ignores lora_a and lora_b
+            fsdp_config = get_lora_ignored_fsdp_config()
+            model = wrap_model_with_fsdp(model, fsdp_config)
+            logger.info("Using FSDP for distributed training")
+        else:
+            # Use DDP as before
+            model = DDP(model, device_ids=[get_local_rank()])
+            logger.info("Using DDP for distributed training")
 
+    print(model.model)
     # build evaluator
     data_args = copy.deepcopy(training_args)
     data_args.dataset = evaluate_datasets[training_args.evaluate_on]
@@ -348,20 +365,32 @@ def train_km(training_args: KMArguments):
 
             if val_loss < best_val and is_main_process():
                 best_val = val_loss
-                raw_model.save_pretrained(training_args.output_dir + "/best_model")
-                training_args.save_config(training_args.output_dir + "/best_model")
-                logger.info(f"Saving model to {training_args.output_dir}")
+                save_path = training_args.output_dir + "/best_model"
+                if training_args.fsdp:
+                    fsdp_save_model(model, save_path + "/mttl_weights.bin")
+                else:
+                    raw_model.save_pretrained(save_path)
+                training_args.save_config(save_path)
+                logger.info(f"Saving model to {save_path}")
 
         if global_step >= training_args.total_steps:
             break
 
     # Also save last model
-    raw_model.save_pretrained(training_args.output_dir + "/last_model")
-    training_args.save_config(training_args.output_dir + "/last_model")
+    save_path = training_args.output_dir + "/last_model"
+    if training_args.fsdp:
+        fsdp_save_model(model, save_path + "/mttl_weights.bin")
+    else:
+        raw_model.save_pretrained(save_path)
+    training_args.save_config(save_path)
 
     if training_args.eval_after_training:
         # reload the best model
-        raw_model.load_weights(training_args.output_dir + "/best_model")
+        best_model_path = training_args.output_dir + "/best_model"
+        if training_args.fsdp:
+            fsdp_load_model(model, best_model_path + "/mttl_weights.bin")
+        else:
+            raw_model.load_weights(best_model_path)
 
         val_loss, eval_score = do_evaluation(
             datamodule, model, loss_function, evaluator
