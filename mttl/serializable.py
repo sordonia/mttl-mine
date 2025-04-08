@@ -57,9 +57,9 @@ class Serializable:
                 # If it's a direct type like int, float, bool, etc.
                 if field_type in {int, float, bool, str}:
                     data_[field.name] = field_type(value)
-                else:
-                    # Fallback to simple assignment for everything else
-                    data_[field.name] = value
+            else:
+                # Fallback to simple assignment for everything else
+                data_[field.name] = value
         return cls(**data_)
 
     def to_json_string(self) -> str:
