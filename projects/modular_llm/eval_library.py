@@ -31,6 +31,10 @@ from mttl.models.modifiers.lora import LoRAConfig
 from mttl.utils import remote_login
 
 
+class LibEvaluationConfig(EvaluationConfig):
+    add_eos_to_downstream_targets: bool = True
+
+
 def eval_in_distribution(module, args: EvaluationConfig, tasks: list):
     args.include_task_source = "*"
     transfer_table = TableLogger()
@@ -166,8 +170,8 @@ def run_eval(args: EvaluationConfig):
         selection=args.expert_selection,
     )
     an_expert = library[next(iter(library.keys()))]
-    base_model = an_expert.expert_info.expert_model
     train_cfg = ExpertConfig.from_dict(an_expert.training_config)
+    base_model = train_cfg.model
 
     loading_kwargs = {
         "device_map": args.device_map,
@@ -364,5 +368,5 @@ def run_eval(args: EvaluationConfig):
 
 
 if __name__ == "__main__":
-    args = EvaluationConfig.parse()
+    args = LibEvaluationConfig.parse()
     run_eval(args)
