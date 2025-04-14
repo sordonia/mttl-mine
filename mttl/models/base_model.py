@@ -170,7 +170,7 @@ class BaseExpertModel(torch.nn.Module, Registrable, PushToHubMixin):
     @InfoContainer.create_context
     def forward(
         self,
-        input_ids,
+        input_ids=None,
         attention_mask=None,
         labels=None,
         **kwargs,

@@ -56,7 +56,7 @@ class InfoContainer:
 
         @functools.wraps(f)
         def wrapper_func(model, **kwargs):
-            if "input_ids" not in kwargs:
+            if "input_ids" not in kwargs and "inputs_embeds" not in kwargs:
                 raise ValueError(
                     "The first argument of the function to wrap must be 'input_ids'."
                 )
