@@ -43,9 +43,7 @@ def set_active_expert(model, expert_name):
     Args:
         model (BaseExpertModel): The model to set the active expert in.
     """
-    if is_dist_avail_and_initialized() and hasattr(model, "module"):
-        model = model.module
-
+    model = get_raw_model(model)
     state = model.config.default_expert_name
     model.set_default_expert(expert_name)
 
