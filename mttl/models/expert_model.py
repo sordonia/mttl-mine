@@ -49,7 +49,11 @@ def set_active_expert(model, expert_name):
 
     yield
 
-    model.set_default_expert(state)
+    if state is None:
+        model.unset_default_expert()
+    else:
+        # restore the previous default expert
+        model.set_default_expert(state)
 
 
 @contextlib.contextmanager
