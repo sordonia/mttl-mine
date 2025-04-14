@@ -33,6 +33,7 @@ from mttl.models.modifiers.base import (
     Modifier,
 )
 from mttl.models.modifiers.modify_model import modify_transformer
+from mttl.utils import get_raw_model
 
 
 @contextlib.contextmanager
@@ -60,8 +61,8 @@ def disable_modifiers(model):
     Args:
         model (BaseExpertModel): The model to disable adapters in.
     """
-    if is_dist_avail_and_initialized() and hasattr(model, "module"):
-        model = model.module
+    # remove ddp / fsdp / deepspeed wrappers
+    model = get_raw_model(model)
 
     model.disable_modifiers()
 
