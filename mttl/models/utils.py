@@ -235,7 +235,7 @@ class MetricLogger(object):
     def __init__(self):
         self.meters = defaultdict(SmoothedValue)
 
-    def update(self, prefix=None, value_dict={}):
+    def update(self, value_dict={}, prefix=None):
         prefix = "" if prefix is None else f"{prefix}/"
         for k, v in value_dict.items():
             if isinstance(v, torch.Tensor):
