@@ -31,10 +31,6 @@ from mttl.models.modifiers.lora import LoRAConfig
 from mttl.utils import remote_login
 
 
-class LibEvaluationConfig(EvaluationConfig):
-    add_eos_to_downstream_targets: bool = True
-
-
 def eval_in_distribution(module, args: EvaluationConfig, tasks: list):
     args.include_task_source = "*"
     transfer_table = TableLogger()
@@ -368,5 +364,5 @@ def run_eval(args: EvaluationConfig):
 
 
 if __name__ == "__main__":
-    args = LibEvaluationConfig.parse()
+    args = EvaluationConfig.parse()
     run_eval(args)
