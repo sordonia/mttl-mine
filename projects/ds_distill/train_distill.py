@@ -1,6 +1,9 @@
 import math
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from pytorch_lightning import seed_everything
 from tqdm import tqdm
 
@@ -13,6 +16,7 @@ from mttl.models.expert_model import (
     disable_modifiers,
     set_active_expert,
 )
+from mttl.models.get_optimizer import get_optimizer_and_scheduler
 from mttl.models.library.expert_library import ExpertLibrary
 from mttl.models.utils import MetricLogger, transfer_batch_to_device
 from mttl.utils import remote_login
@@ -21,6 +25,7 @@ N_NEW_TOKENS = None
 OFFSET = None
 
 
+@dataclass
 class DSDistillConfig(ExpertConfig):
     tie_input_outputs: bool = False
     n_inner_steps: int = 1
@@ -66,25 +71,35 @@ def get_lora_injected_layers(model):
 
 
 def get_grad_loss(lora_layers):
-    layer_losses = []
+    sum_dotp = 0.0
+    sum_ab_2 = 0.0
+    sum_grad_2 = 0.0
+    sum_l1 = 0
+    sum_l2 = 0
     for name, lora_layer in lora_layers.items():
+        if "layers.31" not in name:
+            continue
         AB = (
             lora_layer.lora_b["oracle"].T @ lora_layer.lora_a["oracle"].T
         )  # (out_features, in_features)
         W_grad = lora_layer.weight.grad  # (out_features, in_features)
-        layer_loss = (AB - W_grad).abs().mean()
-        layer_loss = layer_loss  # / AB.abs().mean()
-        layer_losses.append(layer_loss)
+        sum_dotp += (AB * W_grad).sum()
+        sum_ab_2 += (AB * AB).sum()
+        sum_grad_2 += (W_grad * W_grad).sum()
+        sum_l1 += (AB - W_grad).abs().sum()
+        sum_l2 += (AB - W_grad).pow(2).sum()
+    sum_l1 = sum_l1 / len(lora_layers)
+    sum_l2 = sum_l2 / len(lora_layers)
 
-    # TODO: need a way to get the model after an update, so that we can evaluate it on the real data
-    layer_losses = torch.sum(torch.stack(layer_losses))
-    return layer_losses
+    cos_sim = sum_dotp / (sum_ab_2 * sum_grad_2).sqrt()
+    return 1 - cos_sim, sum_l1, sum_l2
 
 
 def create_batch():
     global N_NEW_TOKENS, OFFSET
     # sample a batch of data
     idx = torch.randint(0, args.n_samples, (args.train_batch_size,))
+    # idx = torch.arange(0, args.n_samples) #
 
     # expand idx into input_ids
     input_ids = idx.view(-1, 1) * args.seq_len
@@ -133,26 +148,60 @@ def reset_lora_params(expert):
             param.zero_()
 
 
+@contextmanager
+def silence_logger():
+    """
+    Context manager to silence the logger.
+    """
+    import logging
+
+    logger = logging.getLogger("mttl")
+    old_level = logger.level
+    logger.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        logger.setLevel(old_level)
+
+
 def train_and_eval(model, eval_dataloader):
     fast_expert = model.get_expert_instance("fast_expert")
     reset_lora_params(fast_expert)
 
-    optim = torch.optim.Adam(
-        [param for name, param in model.named_parameters() if "fast_expert" in name],
-        lr=5e-3,
-    )
+    fast_expert_params = [
+        param for name, param in model.named_parameters() if "fast_expert" in name
+    ]
+    for f_pam in fast_expert_params:
+        f_pam.requires_grad = True
+    optim = torch.optim.Adam(fast_expert_params, lr=5e-5)
+
+    args.trainable_param_names = ".*fast_expert.*"
+    args.learning_rate = 5e-3
+    args.total_steps = 5
+
+    with silence_logger():
+        (optim, scheduler), trainable_param_names = get_optimizer_and_scheduler(
+            model, args, -1
+        )
 
     with set_active_expert(model, "fast_expert"):
-        for it in range(10):
+        loss = run_evaluation(model, eval_dataloader)
+        logger.info(f"\tEvaluation loss: {loss} before training")
+
+        for it in range(args.total_steps):
             batch = create_batch()
             batch = transfer_batch_to_device(batch, model.device)
             outputs = model(**batch)
             optim.zero_grad()
             outputs.loss.backward()
             optim.step()
-
+            scheduler.step()
             loss = run_evaluation(model, eval_dataloader)
-            logger.info(f"Inner Evaluation loss: {loss}")
+            logger.info(
+                f"\tInner Evaluation loss: {loss} at step {it} lr {optim.param_groups[0]['lr']}"
+            )
+
+        model.zero_grad()
 
 
 def ds_distill(args: EvaluationConfig):
@@ -249,11 +298,13 @@ def ds_distill(args: EvaluationConfig):
     model.model.config.vocab_size = OFFSET + N_NEW_TOKENS
     model = model.to(device)
 
-    optim = torch.optim.AdamW(
-        [learnable_E, learnable_U],
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
+    args.trainable_param_names = ".*new_weight.*"
+    (optim, scheduler), trainable_param_names = get_optimizer_and_scheduler(
+        model, args, -1
     )
+
+    # Put this here so that Ws have require_grad = True
+    lora_layers = get_lora_injected_layers(model)
 
     """
     # how good is the model at the start?
@@ -270,8 +321,9 @@ def ds_distill(args: EvaluationConfig):
 
     for outer_it in range(args.total_steps):
 
-        if (outer_it + 1) % 10 == 0:
+        if (outer_it + 1) % args.eval_every == 0:
             train_and_eval(model, dm.test_dataloader())
+            lora_layers = get_lora_injected_layers(model)
 
         for inner_it in range(args.n_inner_steps):
             batch = create_batch()
@@ -282,20 +334,28 @@ def ds_distill(args: EvaluationConfig):
 
             outputs.loss.backward(retain_graph=True, create_graph=True)
 
-            layer_losses = get_grad_loss(lora_layers)
-            metric_logger.update({"train_loss": layer_losses.item()})
-            logger.info(f"Step {outer_it} Loss {metric_logger.train_loss.avg}")
+            cosim_loss, l1_loss, l2_loss = get_grad_loss(lora_layers)
+            layer_losses = (
+                cosim_loss  # l1_loss / l1_loss.item() # + l2_loss / l2_loss.item()
+            )
+            metric_logger.update(
+                {
+                    "cossim_loss": cosim_loss.item(),
+                    "l1_loss": l1_loss.item(),
+                    "l2_loss": l2_loss.item(),
+                }
+            )
+            logger.info(
+                f"Step {outer_it} Losses ({metric_logger.cossim_loss.avg:.4f}, {metric_logger.l1_loss.avg:.2f}, {metric_logger.l2_loss.avg:.2}), lr {optim.param_groups[0]['lr']}"
+            )
 
             optim.zero_grad()
             model.zero_grad()
             layer_losses.backward()
             optim.step()
+            scheduler.step()
 
             del outputs, layer_losses
-
-    # Run evaluation with the expert
-    eval_loss = run_evaluation(model, dm.test_dataloader())
-    logger.info(f"Evaluation loss: {eval_loss}")
 
     with disable_modifiers(model):
         base_eval_loss = run_evaluation(model, dm.test_dataloader())
