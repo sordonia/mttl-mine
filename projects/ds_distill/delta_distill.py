@@ -20,82 +20,23 @@ from mttl.models.get_optimizer import get_optimizer_and_scheduler
 from mttl.models.library.expert_library import ExpertLibrary
 from mttl.models.utils import MetricLogger, transfer_batch_to_device
 from mttl.utils import remote_login
-
-
-@dataclass
-class DSDistillConfig(ExpertConfig):
-    tie_input_outputs: bool = False
-    n_inner_steps: int = 1
-    normalize_embeddings: bool = False
-    prefix_length: int = 0
-    n_samples: int = 10
-    seq_len: int = 64
-
-
-class ExtendedLinear(torch.nn.Module):
-    def __init__(self, old_linear, new_weights):
-        super().__init__()
-        assert old_linear.bias is None
-        self.weight = old_linear.weight
-        self.new_weight = new_weights
-
-    def forward(self, x):
-        W = torch.cat([self.weight, self.new_weight], dim=0)
-        return torch.nn.functional.linear(x, W)
-
-
-class ExtendedEmbedding(torch.nn.Module):
-    def __init__(self, old_embedding, new_weights):
-        super().__init__()
-        self.weight = old_embedding.weight
-        self.new_weight = new_weights
-
-    def forward(self, x):
-        W = torch.cat([self.weight, self.new_weight], dim=0)
-        return torch.nn.functional.embedding(x, W)
-
-
-def get_lora_injected_layers(model):
-    layers = {}
-    for name, module in model.named_modules():
-        if hasattr(module, "lora_a"):
-            # TODO: double check this works for MultiExpertModel
-            module.layer.weight.requires_grad = True
-            module.layer.weight.retain_grad()
-            layers[name] = module
-
-    return layers
-
-
-def get_grad_loss(lora_layers):
-    sum_dotp = 0.0
-    sum_ab_2 = 0.0
-    sum_grad_2 = 0.0
-    sum_l1 = 0
-    sum_l2 = 0
-    for name, lora_layer in lora_layers.items():
-        if "layers.31" not in name:
-            continue
-        AB = (
-            lora_layer.lora_b["oracle"].T @ lora_layer.lora_a["oracle"].T
-        )  # (out_features, in_features)
-        W_grad = lora_layer.weight.grad  # (out_features, in_features)
-        sum_dotp += (AB * W_grad).sum()
-        sum_ab_2 += (AB * AB).sum()
-        sum_grad_2 += (W_grad * W_grad).sum()
-        sum_l1 += (AB - W_grad).abs().sum()
-        sum_l2 += (AB - W_grad).pow(2).sum()
-    sum_l1 = sum_l1 / len(lora_layers)
-    sum_l2 = sum_l2 / len(lora_layers)
-
-    cos_sim = sum_dotp / (sum_ab_2 * sum_grad_2).sqrt()
-    return 1 - cos_sim, sum_l1, sum_l2
+from projects.ds_distill.train_distill import (
+    DSDistillConfig,
+    ExtendedEmbedding,
+    ExtendedLinear,
+    get_lora_injected_layers,
+    reset_lora_params,
+    run_evaluation,
+    silence_logger,
+)
 
 
 def create_batch(args):
     # sample a batch of data
-    idx = torch.randint(0, args.n_samples, (args.train_batch_size,))
-    # idx = torch.arange(0, args.n_samples) #
+    if args.n_samples == args.train_batch_size:
+        idx = torch.arange(0, n_samples)
+    else:
+        idx = torch.randint(0, args.n_samples, (args.train_batch_size,))
 
     # expand idx into input_ids
     input_ids = idx.view(-1, 1) * args.seq_len
@@ -104,60 +45,23 @@ def create_batch(args):
 
     batch = {
         "input_ids": input_ids,
-        "labels": input_ids,
         "attention_mask": torch.ones_like(input_ids),
     }
     return batch
 
 
-@torch.no_grad()
-def run_evaluation(model, dataloader):
-    loss = 0
-    pbar = tqdm(total=len(dataloader))
-    for batch in dataloader:
-        batch = transfer_batch_to_device(batch, model.device)
-        with torch.no_grad():
-            # make sure no task label is passed to the model
-            outputs = model(
-                **{"input_ids": batch["input_ids"], "labels": batch["labels"]}
-            )
-            loss += outputs.loss.item()
-            pbar.update(1)
-    pbar.close()
-    return loss / len(dataloader)
+def soft_cross_entropy_loss(target_logits, trainable_logits):
+    # Apply softmax to target_logits to get soft labels (probabilities)
+    soft_targets = F.softmax(target_logits, dim=-1)
 
+    # Apply log_softmax to trainable_logits
+    log_probs = F.log_softmax(trainable_logits, dim=-1)
 
-def reset_lora_params(expert):
-    # reset the weights of the fast expert
-    # TODO: try and leverage the original weight initialization scheme for lora
-    for p_name, param in expert.expert_weights.items():
-        if "lora_a" in p_name:
-            in_features, rank = param.size()
-            assert in_features > rank
-            gain = torch.nn.init.calculate_gain(
-                nonlinearity="leaky_relu", param=math.sqrt(5)
-            )
-            std = gain / math.sqrt(in_features)
-            with torch.no_grad():
-                param.uniform_(-std, std)
-        elif "lora_b" in p_name:
-            param.zero_()
+    # Compute cross-entropy loss
+    # We use the formula: -sum(soft_targets * log_probs) averaged over batch and sequence
+    loss = -(soft_targets * log_probs).sum(dim=-1).mean()
 
-
-@contextmanager
-def silence_logger():
-    """
-    Context manager to silence the logger.
-    """
-    import logging
-
-    logger = logging.getLogger("mttl")
-    old_level = logger.level
-    logger.setLevel(logging.CRITICAL)
-    try:
-        yield
-    finally:
-        logger.setLevel(old_level)
+    return loss
 
 
 def train_and_eval(model, eval_dataloader):
@@ -187,9 +91,19 @@ def train_and_eval(model, eval_dataloader):
         for it in range(args.total_steps):
             batch = create_batch(args)
             batch = transfer_batch_to_device(batch, model.device)
+
+            with set_active_expert(model, "oracle"):
+                with torch.no_grad():
+                    oracle_outputs = model(**batch)
+
             outputs = model(**batch)
+            loss = soft_cross_entropy_loss(oracle_outputs["logits"], outputs["logits"])
+
+            # Now, compute cross entropy loss with soft labels
+            # KL divergence
+
             optim.zero_grad()
-            outputs.loss.backward()
+            loss.backward()
             optim.step()
             scheduler.step()
             loss = run_evaluation(model, eval_dataloader)
@@ -201,7 +115,6 @@ def train_and_eval(model, eval_dataloader):
 
 
 def ds_distill(args: EvaluationConfig):
-
     seed_everything(args.seed, workers=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -270,6 +183,7 @@ def ds_distill(args: EvaluationConfig):
     args.OFFSET = old_embeds.num_embeddings
 
     # Build the learnable embeddings
+    old_embed_norm = torch.norm(old_embeds.weight, dim=-1).mean()
     learnable_E = old_embeds.weight[: args.N_NEW_TOKENS, :].clone().detach()
     # shuffle on the first axis
     learnable_E = learnable_E[torch.randperm(args.N_NEW_TOKENS)]
@@ -280,17 +194,7 @@ def ds_distill(args: EvaluationConfig):
         ExtendedEmbedding(model.model.get_input_embeddings(), learnable_E)
     )
 
-    # Build the learnable unembeddings
-    learnable_U = old_unembeds.weight[: args.N_NEW_TOKENS, :].clone().detach()
-    # shuffle on the first axis
-    learnable_U = learnable_U[torch.randperm(args.N_NEW_TOKENS)]
-    # learnable_U = learnable_U.reshape(args.n_samples, args.seq_len, -1)
-    learnable_U = torch.nn.Parameter(learnable_U)
-    learnable_U.requires_grad = True
-    model.model.set_output_embeddings(
-        ExtendedLinear(model.model.get_output_embeddings(), learnable_U)
-    )
-    model.model.config.vocab_size = args.OFFSET + args.N_NEW_TOKENS
+    # model.model.config.vocab_size = args.OFFSET + args.N_NEW_TOKENS
     model = model.to(device)
 
     args.trainable_param_names = ".*new_weight.*"
@@ -327,30 +231,36 @@ def ds_distill(args: EvaluationConfig):
             with disable_modifiers(model):
                 outputs = model(**batch)
 
-            outputs.loss.backward(retain_graph=True, create_graph=True)
+            with set_active_expert(model, "oracle"):
+                oracle_outputs = model(**batch)
 
-            cosim_loss, l1_loss, l2_loss = get_grad_loss(lora_layers)
-            layer_losses = (
-                cosim_loss  # l1_loss / l1_loss.item() # + l2_loss / l2_loss.item()
+            KL = torch.nn.functional.kl_div(
+                F.log_softmax(outputs["logits"], dim=-1),
+                F.softmax(oracle_outputs["logits"], dim=-1),
+                reduction="batchmean",
             )
-            metric_logger.update(
-                {
-                    "cossim_loss": cosim_loss.item(),
-                    "l1_loss": l1_loss.item(),
-                    "l2_loss": l2_loss.item(),
-                }
-            )
+
+            # we want to **maximize** the KL divergence
+            loss = -KL
+            loss = -soft_cross_entropy_loss(oracle_outputs["logits"], outputs["logits"])
+
             logger.info(
-                f"Step {outer_it} Losses ({metric_logger.cossim_loss.avg:.4f}, {metric_logger.l1_loss.avg:.2f}, {metric_logger.l2_loss.avg:.2}), lr {optim.param_groups[0]['lr']}"
+                f"Step {outer_it} Losses ({loss.item():.4f}) lr {optim.param_groups[0]['lr']}"
             )
 
             optim.zero_grad()
             model.zero_grad()
-            layer_losses.backward()
+            loss.backward()
             optim.step()
             scheduler.step()
 
-            del outputs, layer_losses
+            # reset the norm of learnable_E to
+            # learnable_E.data.div_(torch.norm(learnable_E.data, dim=-1, keepdim=True)).mul_(old_embed_norm)
+            logger.info(
+                f"learnable_E norm: {torch.norm(learnable_E.data, dim=-1).mean()} vs {old_embed_norm}"
+            )
+
+            del outputs, loss
 
     with disable_modifiers(model):
         base_eval_loss = run_evaluation(model, dm.test_dataloader())
