@@ -34,7 +34,7 @@ from projects.ds_distill.train_distill import (
 def create_batch(args):
     # sample a batch of data
     if args.n_samples == args.train_batch_size:
-        idx = torch.arange(0, n_samples)
+        idx = torch.arange(0, args.n_samples)
     else:
         idx = torch.randint(0, args.n_samples, (args.train_batch_size,))
 
@@ -50,7 +50,7 @@ def create_batch(args):
     return batch
 
 
-def soft_cross_entropy_loss(target_logits, trainable_logits):
+def soft_cross_entropy_loss(target_logits, trainable_logits, last_k_tokens=10):
     # Apply softmax to target_logits to get soft labels (probabilities)
     soft_targets = F.softmax(target_logits, dim=-1)
 
@@ -59,6 +59,10 @@ def soft_cross_entropy_loss(target_logits, trainable_logits):
 
     # Compute cross-entropy loss
     # We use the formula: -sum(soft_targets * log_probs) averaged over batch and sequence
+    if last_k_tokens > 0:
+        # Only consider the last k tokens
+        soft_targets = soft_targets[:, -last_k_tokens:, :]
+        log_probs = log_probs[:, -last_k_tokens:, :]
     loss = -(soft_targets * log_probs).sum(dim=-1).mean()
 
     return loss
@@ -73,7 +77,7 @@ def train_and_eval(model, eval_dataloader):
     ]
     for f_pam in fast_expert_params:
         f_pam.requires_grad = True
-    optim = torch.optim.Adam(fast_expert_params, lr=5e-5)
+    optim = torch.optim.Adam(fast_expert_params, lr=5e-6)
 
     args.trainable_param_names = ".*fast_expert.*"
     args.learning_rate = 5e-3
@@ -187,6 +191,10 @@ def ds_distill(args: EvaluationConfig):
     learnable_E = old_embeds.weight[: args.N_NEW_TOKENS, :].clone().detach()
     # shuffle on the first axis
     learnable_E = learnable_E[torch.randperm(args.N_NEW_TOKENS)]
+    learnable_E = (
+        torch.randn_like(learnable_E) * math.sqrt(1 / old_embeds.embedding_dim)
+        + learnable_E
+    )
     # learnable_E = learnable_E.reshape(args.n_samples, args.seq_len, -1)
     learnable_E = torch.nn.Parameter(learnable_E)
     learnable_E.requires_grad = True
@@ -245,7 +253,7 @@ def ds_distill(args: EvaluationConfig):
             loss = -soft_cross_entropy_loss(oracle_outputs["logits"], outputs["logits"])
 
             logger.info(
-                f"Step {outer_it} Losses ({loss.item():.4f}) lr {optim.param_groups[0]['lr']}"
+                f"Step {outer_it} Losses ({loss.item():.4f}) lr {optim.param_groups[0]['lr']}, learnable_E norm: {torch.norm(learnable_E.data, dim=-1).mean()} vs {old_embed_norm}"
             )
 
             optim.zero_grad()
@@ -256,9 +264,6 @@ def ds_distill(args: EvaluationConfig):
 
             # reset the norm of learnable_E to
             # learnable_E.data.div_(torch.norm(learnable_E.data, dim=-1, keepdim=True)).mul_(old_embed_norm)
-            logger.info(
-                f"learnable_E norm: {torch.norm(learnable_E.data, dim=-1).mean()} vs {old_embed_norm}"
-            )
 
             del outputs, loss
 
