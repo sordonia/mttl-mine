@@ -31,6 +31,27 @@ from projects.ds_distill.train_distill import (
 )
 
 
+@torch.no_grad()
+def run_evaluation_sce(model, dataloader):
+    loss = 0
+    pbar = tqdm(total=len(dataloader))
+    for batch in dataloader:
+        batch = transfer_batch_to_device(batch, model.device)
+        with torch.no_grad():
+            with set_active_expert(model, "oracle"):
+                with torch.no_grad():
+                    oracle_outputs = model(**batch)
+
+            outputs = model(**batch)
+            sce_loss, entropy = soft_cross_entropy_loss(
+                oracle_outputs["logits"], outputs["logits"]
+            )
+            loss += sce_loss
+            pbar.update(1)
+    pbar.close()
+    return loss / len(dataloader)
+
+
 def create_batch(args):
     # sample a batch of data
     if args.n_samples == args.train_batch_size:
@@ -65,7 +86,12 @@ def soft_cross_entropy_loss(target_logits, trainable_logits, last_k_tokens=10):
         log_probs = log_probs[:, -last_k_tokens:, :]
     loss = -(soft_targets * log_probs).sum(dim=-1).mean()
 
-    return loss
+    # We want the teacher (target logits) to be confident in its predictions
+    # TODO: apply a entropy penalty to the soft targets
+    entropy_loss = -torch.sum(soft_targets * torch.log(soft_targets + 1e-10), dim=-1)
+    # loss -= entropy_loss.sum(1).mean()
+
+    return loss, entropy_loss
 
 
 def train_and_eval(model, eval_dataloader):
@@ -101,7 +127,9 @@ def train_and_eval(model, eval_dataloader):
                     oracle_outputs = model(**batch)
 
             outputs = model(**batch)
-            loss = soft_cross_entropy_loss(oracle_outputs["logits"], outputs["logits"])
+            loss, entropy = soft_cross_entropy_loss(
+                oracle_outputs["logits"], outputs["logits"]
+            )
 
             # Now, compute cross entropy loss with soft labels
             # KL divergence
@@ -213,14 +241,18 @@ def ds_distill(args: EvaluationConfig):
     # Put this here so that Ws have require_grad = True
     lora_layers = get_lora_injected_layers(model)
 
-    """
     # how good is the model at the start?
+    """
     with set_active_expert(model, "fast_expert"):
         base_eval_loss = run_evaluation(model, dm.test_dataloader())
         logger.info(f"New expert evaluation loss: {base_eval_loss}")
+    """
     with set_active_expert(model, "oracle"):
         base_eval_loss = run_evaluation(model, dm.test_dataloader())
         logger.info(f"Oracle evaluation loss: {base_eval_loss}")
+        sce_eval_loss = run_evaluation_sce(model, dm.test_dataloader())
+        logger.info(f"Oracle SCE evaluation loss: {sce_eval_loss}")
+    """
     with disable_modifiers(model):
         base_eval_loss = run_evaluation(model, dm.test_dataloader())
         logger.info(f"Base evaluation loss: {base_eval_loss}")
@@ -250,10 +282,11 @@ def ds_distill(args: EvaluationConfig):
 
             # we want to **maximize** the KL divergence
             loss = -KL
-            loss = -soft_cross_entropy_loss(oracle_outputs["logits"], outputs["logits"])
+            # loss, entropy = soft_cross_entropy_loss(oracle_outputs["logits"], outputs["logits"])
+            # loss =
 
             logger.info(
-                f"Step {outer_it} Losses ({loss.item():.4f}) lr {optim.param_groups[0]['lr']}, learnable_E norm: {torch.norm(learnable_E.data, dim=-1).mean()} vs {old_embed_norm}"
+                f"Step {outer_it} Losses ({-1 * loss.item():.4f}) lr {optim.param_groups[0]['lr']}, learnable_E norm: {torch.norm(learnable_E.data, dim=-1).mean()} vs {old_embed_norm}"
             )
 
             optim.zero_grad()
