@@ -263,3 +263,9 @@ class MetricLogger(object):
 
     def __len__(self):
         return len(self.meters)
+
+    def __str__(self):
+        out = ""
+        for name, meter in self.meters.items():
+            out += f"{name}: {meter.avg:.5f}\t"
+        return out
