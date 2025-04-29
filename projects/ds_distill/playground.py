@@ -28,7 +28,11 @@ from projects.ds_distill.utils import (
     create_batch,
     run_evaluation,
     reset_lora_params,
-    silence_logger
+    silence_logger,
+    overfit_expert,
+    soft_cross_entropy_loss, 
+    entropy as entropy_fn,
+    grad_alignment
 )
 
 @dataclass
@@ -39,42 +43,23 @@ class DSDistillConfig(ExpertConfig):
     prefix_length: int = 0
     n_samples: int = 10
     seq_len: int = 64
+    # NOTE : left padding for now
+    padding_side: str = "left"
 
-
-def get_grad_loss(lora_layers):
-    sum_dotp = 0.0
-    sum_ab_2 = 0.0
-    sum_grad_2 = 0.0
-    sum_l1 = 0
-    sum_l2 = 0
-    for name, lora_layer in lora_layers.items():
-        AB = (
-            lora_layer.lora_b["oracle"].T @ lora_layer.lora_a["oracle"].T
-        )  # (out_features, in_features)
-        W_grad = lora_layer.weight.grad  # (out_features, in_features)
-        sum_dotp += (AB * W_grad).sum()
-        sum_ab_2 += (AB * AB).sum()
-        sum_grad_2 += (W_grad * W_grad).sum()
-        sum_l1 += (AB - W_grad).abs().sum()
-        sum_l2 += (AB - W_grad).pow(2).sum()
-    sum_l1 = sum_l1 / len(lora_layers)
-    sum_l2 = sum_l2 / len(lora_layers)
-
-    cos_sim = sum_dotp / (sum_ab_2 * sum_grad_2).sqrt()
-    return 1 - cos_sim, sum_l1, sum_l2
 
 def train_and_eval(model, eval_dataloader):
-    fast_expert = model.get_expert_instance("fast_expert")
+    fast_expert = model.get_expert_instance("new_expert")
+    lora_layers = get_lora_injected_layers(model)
     reset_lora_params(fast_expert)
 
     fast_expert_params = [
-        param for name, param in model.named_parameters() if "fast_expert" in name
+        param for name, param in model.named_parameters() if "new_expert" in name
     ]
     for f_pam in fast_expert_params:
         f_pam.requires_grad = True
     optim = torch.optim.Adam(fast_expert_params, lr=5e-5)
 
-    args.trainable_param_names = ".*fast_expert.*"
+    args.trainable_param_names = ".*new_expert.*"
     args.learning_rate = 5e-3
     args.total_steps = 5
 
@@ -83,21 +68,33 @@ def train_and_eval(model, eval_dataloader):
             model, args, -1
         )
 
-    with set_active_expert(model, "fast_expert"):
+    with set_active_expert(model, "new_expert"):
         loss = run_evaluation(model, eval_dataloader)
         logger.info(f"\tEvaluation loss: {loss} before training")
 
         for it in range(args.total_steps):
-            batch = create_batch(args, labels=True)
+            batch = create_batch(args, labels=False)
             batch = transfer_batch_to_device(batch, model.device)
             outputs = model(**batch)
+
+            with set_active_expert(model, "oracle"):
+                oracle_outputs = model(**batch)
+                loss, entropy = soft_cross_entropy_loss(
+                    oracle_outputs["logits"], outputs["logits"], batch['attention_mask']
+                )
+
             optim.zero_grad()
-            outputs.loss.backward()
+            loss.backward()
+
+            # check grad alignment
+            grad_align = grad_alignment(lora_layers, oracle_expert_name="oracle")
+            grad_align = grad_align['total'].detach()
+
             optim.step()
             scheduler.step()
             loss = run_evaluation(model, eval_dataloader)
             logger.info(
-                f"\tInner Evaluation loss: {loss} at step {it} lr {optim.param_groups[0]['lr']}"
+                f"\tInner Evaluation loss: {loss} at step {it} lr {optim.param_groups[0]['lr']}\t grad align {grad_align:.7f}"
             )
 
         model.zero_grad()
@@ -131,7 +128,7 @@ def ds_distill(args: EvaluationConfig):
     train_cfg = ExpertConfig.from_dict(expert.training_config)
 
     # always overwrite these args
-    for arg in ["subsample_test", "predict_batch_size", "model"]:
+    for arg in ["subsample_test", "predict_batch_size", "model", "padding_side"]:
         if hasattr(args, arg) and getattr(args, arg) is not None:
             logger.info(f"Overriding {arg} with {getattr(args, arg)}")
             setattr(train_cfg, arg, getattr(args, arg))
@@ -153,7 +150,10 @@ def ds_distill(args: EvaluationConfig):
 
     model.add_expert_instance(expert, expert_name="oracle")
     model.add_empty_expert(
-        expert_name="fast_expert", expert_config=expert.expert_config
+        expert_name="overfit_one_sample", expert_config=expert.expert_config
+    )
+    model.add_empty_expert(
+        expert_name="new_expert", expert_config=expert.expert_config
     )
 
     # set all parameters to not require gradients
@@ -166,12 +166,37 @@ def ds_distill(args: EvaluationConfig):
     # build the datamodule initially used to train the expert
     dm = get_datamodule(train_cfg)
 
+    # Let's overfit the expert
+    overfit_dl = overfit_expert(model, 'overfit_one_sample', train_cfg, args)
+    overfit_batch = next(iter(overfit_dl))
+    overfit_batch = transfer_batch_to_device(overfit_batch, model.device)
+
+    # how good is the model at the start?
+    with disable_modifiers(model):
+        base_eval_loss = run_evaluation(model, dm.test_dataloader())
+        logger.info(f"Base evaluation loss: {base_eval_loss}")
+    with set_active_expert(model, "oracle"):
+        oracle_eval_loss = run_evaluation(model, dm.test_dataloader())
+        logger.info(f"Oracle evaluation loss: {oracle_eval_loss}")
+        oracle_outputs = model(**{'input_ids': overfit_batch['input_ids'], 'attention_mask': overfit_batch['attention_mask']})
+        oracle_ent = entropy_fn(oracle_outputs['logits'], overfit_batch['attention_mask']).item()
+    with set_active_expert(model, "overfit_one_sample"):
+        overfit_eval_loss = run_evaluation(model, dm.test_dataloader())
+        overfit_train_loss = run_evaluation(model, overfit_dl)
+        logger.info(f"Overfit evaluation loss: {overfit_eval_loss}, train loss: {overfit_train_loss}")
+        
+        overfit_outputs = model(**{'input_ids': overfit_batch['input_ids'], 'attention_mask': overfit_batch['attention_mask']})
+        overfit_ent = entropy_fn(overfit_outputs['logits'], overfit_batch['attention_mask']).item()
+
+    TARGET_EXPERT_NAME = 'oracle'
+    TARGET_ENT = {'overfit_one_sample': overfit_ent, 'oracle': oracle_ent}[TARGET_EXPERT_NAME]
+
     # easy way to get the label indices
     args.N_NEW_TOKENS = args.n_samples * args.seq_len
     old_embeds = model.model.get_input_embeddings()
     old_unembeds = model.model.get_output_embeddings()
     args.OFFSET = old_embeds.num_embeddings
-    logger.info(f'Added {args.N_NEW_TOKENS} new tokens to the model')
+    logger.info(f"Added {args.N_NEW_TOKENS} new tokens to the model")
 
     # Build the learnable embeddings
     learnable_E = old_embeds.weight[: args.N_NEW_TOKENS, :].clone().detach()
@@ -184,17 +209,7 @@ def ds_distill(args: EvaluationConfig):
         ExtendedEmbedding(model.model.get_input_embeddings(), learnable_E)
     )
 
-    # Build the learnable unembeddings
-    learnable_U = old_unembeds.weight[: args.N_NEW_TOKENS, :].clone().detach()
-    # shuffle on the first axis
-    learnable_U = learnable_U[torch.randperm(args.N_NEW_TOKENS)]
-    # learnable_U = learnable_U.reshape(args.n_samples, args.seq_len, -1)
-    learnable_U = torch.nn.Parameter(learnable_U)
-    learnable_U.requires_grad = True
-    model.model.set_output_embeddings(
-        ExtendedLinear(model.model.get_output_embeddings(), learnable_U)
-    )
-    model.model.config.vocab_size = args.OFFSET + args.N_NEW_TOKENS
+    # model.model.config.vocab_size = args.OFFSET + args.N_NEW_TOKENS
     model = model.to(device)
 
     args.trainable_param_names = ".*new_weight.*"
@@ -205,56 +220,51 @@ def ds_distill(args: EvaluationConfig):
     # Put this here so that Ws have require_grad = True
     lora_layers = get_lora_injected_layers(model)
 
-    """
-    # how good is the model at the start?
-    with set_active_expert(model, "fast_expert"):
-        base_eval_loss = run_evaluation(model, dm.test_dataloader())
-        logger.info(f"New expert evaluation loss: {base_eval_loss}")
-    with set_active_expert(model, "oracle"):
-        base_eval_loss = run_evaluation(model, dm.test_dataloader())
-        logger.info(f"Oracle evaluation loss: {base_eval_loss}")
-    with disable_modifiers(model):
-        base_eval_loss = run_evaluation(model, dm.test_dataloader())
-        logger.info(f"Base evaluation loss: {base_eval_loss}")
-    """
-
     for outer_it in range(args.total_steps):
 
         if (outer_it + 1) % args.eval_every == 0:
             train_and_eval(model, dm.test_dataloader())
             lora_layers = get_lora_injected_layers(model)
 
-        for inner_it in range(args.n_inner_steps):
-            batch = create_batch(args, labels=True)
-            batch = transfer_batch_to_device(batch, model.device)
+        batch = create_batch(args, labels=False)
+        batch = transfer_batch_to_device(batch, model.device)
 
-            with disable_modifiers(model):
-                outputs = model(**batch)
+        with set_active_expert(model, TARGET_EXPERT_NAME):
+            oracle_outputs = model(**batch)
+            entropy = entropy_fn(oracle_outputs["logits"], batch['attention_mask'])
 
-            outputs.loss.backward(retain_graph=True, create_graph=True)
+        with disable_modifiers(model):
+            base_outputs = model(**batch)
+            base_entropy = entropy_fn(base_outputs["logits"], batch['attention_mask'])
 
-            cosim_loss, l1_loss, l2_loss = get_grad_loss(lora_layers)
-            layer_losses = (
-                cosim_loss  # l1_loss / l1_loss.item() # + l2_loss / l2_loss.item()
+        '''    
+        with set_active_expert(model, "new_expert"):
+            outputs = model(**batch)
+            loss, entropy = soft_cross_entropy_loss(
+                oracle_outputs["logits"], outputs["logits"], batch['attention_mask']
             )
-            metric_logger.update(
-                {
-                    "cossim_loss": cosim_loss.item(),
-                    "l1_loss": l1_loss.item(),
-                    "l2_loss": l2_loss.item(),
-                }
-            )
-            logger.info(
-                f"Step {outer_it} Losses ({metric_logger.cossim_loss.avg:.4f}, {metric_logger.l1_loss.avg:.2f}, {metric_logger.l2_loss.avg:.2}), lr {optim.param_groups[0]['lr']}"
-            )
+            breakpoint()
+            xx = 1
+        '''
 
-            optim.zero_grad()
-            model.zero_grad()
-            layer_losses.backward()
-            optim.step()
-            scheduler.step()
 
-            del outputs, layer_losses
+        loss = entropy.mean() - base_entropy.mean()
+        metric_logger.update(
+            {
+                "entropy": entropy.mean().item(),
+                "base_entropy": base_entropy.mean().item(),
+                "entropy_delta": (entropy - base_entropy).mean().item(),
+            }
+        )
+        logger.info(
+            f"Step {outer_it} Losses ({metric_logger}), lr {optim.param_groups[0]['lr']}"
+        )
+
+        optim.zero_grad()
+        model.zero_grad()
+        loss.backward()
+        optim.step()
+        scheduler.step()
 
     with disable_modifiers(model):
         base_eval_loss = run_evaluation(model, dm.test_dataloader())
