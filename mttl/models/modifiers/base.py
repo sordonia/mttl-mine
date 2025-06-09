@@ -200,6 +200,9 @@ def modify_with_adapter(transformer, config, adapter_klass):
                         adapter_klass(config, layer),
                     )
 
+                    # set the layer name for the adapter
+                    getattr(module, c_name).__layer_name__ = f'{m_name}.{c_name}'
+
     target_2_source_param = get_target_2_source_param_mapping(
         transformer.named_parameters(), config.tie_params
     )
