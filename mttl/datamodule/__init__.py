@@ -15,9 +15,15 @@ from mttl.datamodule.openbookqa_data_module import (
     OpenbookQADataConfig,
     OpenbookQAMultiChoiceDataModule,
 )
+from mttl.datamodule.orca_data_module import OrcaDataConfig, OrcaDataModule
 from mttl.datamodule.piqa_data_module import PiqaDataConfig, PiqaMultiChoiceDataModule
 from mttl.datamodule.superglue_data_module import BoolQDataModule, SuperGLUEDataConfig
 from mttl.datamodule.winogrande_data_module import (
     WinograndeDataConfig,
     WinograndeMultiChoiceDataModule,
+)
+
+from mttl.datamodule.orca_data_module import (
+    OrcaDataConfig,
+    OrcaDataModule,
 )

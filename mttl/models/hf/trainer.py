@@ -71,8 +71,8 @@ class ExpertModelTrainer(Trainer):
         self._extra_logs.update(metrics)
 
     def _maybe_log_save_evaluate(
-        self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval
-    ):
+        self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval,
+    *args, **kwargs):
         if (
             self.control.should_log
             and self.state.global_step > self._globalstep_last_logged
@@ -118,12 +118,12 @@ class ExpertModelTrainer(Trainer):
             metrics = self._evaluate(trial, ignore_keys_for_eval)
 
         if self.control.should_save:
-            self._save_checkpoint(model, trial, metrics=metrics)
+            self._save_checkpoint(model, trial) #, metrics=metrics)
             self.control = self.callback_handler.on_save(
                 self.args, self.state, self.control
             )
 
-    def compute_loss(self, model, batch, return_outputs=False):
+    def compute_loss(self, model, batch, return_outputs=False, *args, **kwargs):
         outputs = model(**batch)
         return (outputs.loss, outputs.logits) if return_outputs else outputs.loss
 
