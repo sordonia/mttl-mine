@@ -159,17 +159,19 @@ def ds_distill(args: EvaluationConfig):
 
     remote_login(args.remote_token)
 
+    # Ensure single expert selection for distillation
     assert (
-        len(args.finetune_task_name.split(",")) == 1
+        args.expert_name or len(args.finetune_task_name.split(",")) == 1
     ), "Please provide a single expert selection for which to extract info"
+    expert_name = args.expert_name or args.finetune_task_name.split(",")[0]
 
     library = ExpertLibrary.get_expert_library(
         repo_id=args.library_id,
         token=args.remote_token,
         destination_id=args.destination_library_id,
-        selection=args.finetune_task_name,
+        selection=expert_name,
     )
-    expert = library[args.finetune_task_name]
+    expert = library[expert_name]
     train_cfg = ExpertConfig.from_dict(expert.training_config)
 
     # always overwrite these args
