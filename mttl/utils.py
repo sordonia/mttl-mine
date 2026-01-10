@@ -4,12 +4,14 @@ import hashlib
 import os
 import random
 import string
+from contextlib import contextmanager
 from datetime import time
 from functools import wraps
 from time import sleep
 from typing import Optional
 
 import numpy as np
+import psutil
 import torch
 import torch.nn as nn
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
@@ -298,3 +300,49 @@ def upload_library(expert_library, module_or_path, expert_name=None):
             expert_library.add_expert_from_ckpt(module_or_path, expert_name)
         else:
             raise ValueError("Model class not recognized")
+
+
+def get_raw_model(model):
+    # Remove FSDP or DDP or DeepSpeed wrappers from the model
+    # and return the raw model
+    from deepspeed import DeepSpeedEngine
+    from torch.distributed.fsdp.fully_sharded_data_parallel import (
+        FullyShardedDataParallel as FSDP,
+    )
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    if isinstance(model, FSDP):
+        return model.module
+    elif isinstance(model, DDP):
+        return model.module
+    elif isinstance(model, DeepSpeedEngine):
+        return model.module
+    else:
+        return model
+
+
+@contextmanager
+def toggle_cache(model, enable=True):
+    """Swap the specified set of KMs from CPU to GPU."""
+    previous_cache = model.model.config.use_cache
+    model.model.config.use_cache = enable
+    yield
+    model.model.config.use_cache = previous_cache
+
+
+def get_ram(pid=None):
+    if pid is None:
+        pid = os.getpid()
+    process = psutil.Process(pid)
+    mem_info = process.memory_info()
+    used = mem_info.rss / 1024**3  # Convert bytes to GB
+    total = psutil.virtual_memory().total / 1024**3
+    return f"RAM: {used:.4f}/{total:.2f}GB"
+
+
+def get_vram():
+    free = torch.cuda.mem_get_info()[0] / 1024**3
+    total = torch.cuda.mem_get_info()[1] / 1024**3
+    total_cubes = 24
+    free_cubes = int(total_cubes * free / total)
+    return f"VRAM: {total - free:.2f}/{total:.2f}GB\t"  # VRAM:[' + (total_cubes - free_cubes) * '▮' + free_cubes * '▯' + ']'

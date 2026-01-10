@@ -24,6 +24,7 @@ def test_packing_and_attn(tiny_flan_id):
         "max_seq_per_pack": 4,
         "pack_sequences": False,
         "max_input_length": 1024,
+        "subsample_per_task": True,
     }
     config = FlatMultiTaskConfig(**common_kwargs)
     dm = FlatMultiTaskModule(config)
@@ -49,7 +50,7 @@ def test_packing_and_attn(tiny_flan_id):
     assert len(packed_ids) == sum([len(x) for x in input_ids])
 
     # Check if the data is the one we expect (this can change if you change the model / tokenizer)
-    assert sum([sum(x) for x in input_ids]) == sum(packed_ids) == 3348702
+    assert sum([sum(x) for x in input_ids]) == sum(packed_ids) == 3348075
 
     packed_batch = collator([packed_ds[0]])
     input_batch = collator([ds[idx] for idx in range(first_seq_len)])

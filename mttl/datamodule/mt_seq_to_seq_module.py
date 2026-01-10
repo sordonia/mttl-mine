@@ -165,7 +165,7 @@ class FlatMultiTaskModule(DataModule):
             dev_dataset,
             test_dataset,
         ) = maybe_filter_hf_dataset_by_task(
-            self.dataset, "task_name", self.config.finetune_task_name, num_proc=n_proc
+            self.dataset, "task_name", self.config.finetune_task_name, n_proc=n_proc
         )
 
         if self.config.augment_few_shot > 0:
@@ -198,7 +198,7 @@ class FlatMultiTaskModule(DataModule):
         self.dev_dataset = dev_dataset
         self.test_dataset = test_dataset
 
-        if len(self.test_dataset) == 0:
+        if self.test_dataset is None or len(self.test_dataset) == 0:
             self.test_dataset = self.dev_dataset
 
 
@@ -251,18 +251,14 @@ class FlanModule(DataModule):
                 desc="Filtering task sources",
             )
 
-        (self._task_names, self._task_to_id, train_dataset, _, _) = (
-            maybe_filter_hf_dataset_by_task(
-                dataset, "task_name", self.config.finetune_task_name, num_proc=num_proc
-            )
-        )
-
-        train_dataset = apply_source_template(
-            train_dataset, self.config.source_template
-        )
-
-        train_dataset, dev_dataset, test_dataset = split_on_split_column(
-            train_dataset, num_proc=num_proc
+        (
+            self._task_names,
+            self._task_to_id,
+            train_dataset,
+            dev_dataset,
+            test_dataset,
+        ) = maybe_filter_hf_dataset_by_task(
+            dataset, "task_name", self.config.finetune_task_name, n_proc=num_proc
         )
 
         if self.config.remove_phi_eval_tasks:

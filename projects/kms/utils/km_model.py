@@ -14,22 +14,22 @@ from mttl.models.containers.selectors.poly_selector import PolySelectorConfig
 from mttl.models.expert_context import InfoContainer
 from mttl.models.expert_model import (
     BaseExpertModel,
+    BaseExpertModelConfig,
     ExpertModel,
     ExpertModelConfig,
     MoEModelConfig,
     MultiExpertMixin,
+    MultiExpertModel,
+    MultiExpertModelConfig,
 )
 from mttl.models.library.expert_library import ExpertLibrary
 from mttl.models.modifiers.base import AutoModifierConfig
 from projects.kms.utils.km_selector import KnowledgeExtractorSelectorConfig
+from projects.kms.utils.simple_utils import cpu_offload
 
 
 @dataclass
-class KEMoEModelConfig(MoEModelConfig):
-    # expert name
-    ke_expert_name: str = "KE"
-    # expert path
-    ke_expert_path: str = None
+class KMMoEModelConfig(BaseExpertModelConfig):
     library_id: str = None
     expert_selection: List[str] = None
     # if selector_config is not None, then we use it to select experts
@@ -37,12 +37,11 @@ class KEMoEModelConfig(MoEModelConfig):
     # if modifier_config is not None, then we create moe_num_experts with this modifier
     modifier_config: AutoModifierConfig = None
     # if cpu_offload is True, then we offload the computation to the CPU
-    cpu_offload: bool = False
+    eval_cpu_offload: bool = False
 
 
-@BaseExpertModel.register("moe_ke", config_cls=KEMoEModelConfig)
-class KEMoEModel(BaseExpertModel, MultiExpertMixin):
-    """MoeModel that can accomodate a Knowledge Extractor"""
+@BaseExpertModel.register("moe_km", config_cls=KMMoEModelConfig)
+class KMMoEModel(BaseExpertModel, MultiExpertMixin):
 
     @InfoContainer.create_context
     def forward(
@@ -52,10 +51,52 @@ class KEMoEModel(BaseExpertModel, MultiExpertMixin):
         labels=None,
         **kwargs,
     ):
-        outputs = self.model.forward(
-            input_ids, attention_mask=attention_mask, labels=labels, **kwargs
-        )
+        should_cpu_offload = not self.training and self.config.eval_cpu_offload
+        with cpu_offload(
+            self,
+            InfoContainer.get().routing_infos.task_names,
+            enable=should_cpu_offload,
+        ):
+            outputs = self.model.forward(
+                input_ids, attention_mask=attention_mask, labels=labels, **kwargs
+            )
         return outputs
+
+    @InfoContainer.create_context
+    def generate(
+        self,
+        input_ids,
+        attention_mask=None,
+        **kwargs,
+    ):
+        should_cpu_offload = not self.training and self.config.eval_cpu_offload
+        with cpu_offload(
+            self,
+            InfoContainer.get().routing_infos.task_names,
+            enable=should_cpu_offload,
+        ):
+            generations = self.model.generate(
+                inputs=input_ids,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        return generations
+
+
+@dataclass
+class KEMoEModelConfig(KMMoEModelConfig):
+    # expert name
+    ke_expert_name: str = "KE"
+    # expert path
+    ke_expert_path: str = None
+    # if cpu_offload is True, then we offload the computation to the CPU
+    eval_cpu_offload: bool = False
+
+
+# Copying the setup of MoEModel
+@BaseExpertModel.register("moe_ke", config_cls=KEMoEModelConfig)
+class KEMoEModel(KMMoEModel):
+    """MoeModel that can accomodate a Knowledge Extractor"""
 
     def __init__(self, config, **kwargs):
         # If no selectors have been provided, we default to the KnowledgeExtractorSelector
@@ -100,66 +141,3 @@ class KEMoEModel(BaseExpertModel, MultiExpertMixin):
             self.add_empty_expert(
                 self.ke_expert_name, expert_config=an_expert.expert_config
             )
-
-
-@dataclass
-class EMAExpertModelConfig(ExpertModelConfig, MoEModelConfig):
-    ema_coef: float = 0.999
-    modifier_config: AutoModifierConfig = None
-    default_expert: str = "KM"
-    downscale_factor: int = 16
-
-
-@BaseExpertModel.register("ema_km", config_cls=EMAExpertModelConfig)
-class EMAExpertModel(BaseExpertModel, MultiExpertMixin):
-    """MoeModel that can accomodate a Knowledge Extractor"""
-
-    def __init__(self, config, **kwargs):
-
-        config.selector_config = DefaultExpertSelectorConfig()
-        super().__init__(config, **kwargs)
-
-        ema_modif_config = deepcopy(config.modifier_config)
-        ema_modif_config.lora_alpha /= self.config.downscale_factor
-
-        self.add_empty_expert("EMA", expert_config=ema_modif_config)
-        # Make sure existing experts are not trainable
-        for param in self.parameters():
-            param.requires_grad = False
-
-        self.add_empty_expert("KM", expert_config=config.modifier_config)
-
-        # Set EMA weights to match the KM weights
-        self.ema_update(ema_coef=0.0)
-
-    @torch.no_grad()
-    def ema_update(self, ema_coef=None):
-        if ema_coef is None:
-            ema_coef = self.config.ema_coef
-
-        expert = self.get_expert_instance("KM")
-        ema_expert = self.get_expert_instance(f"EMA")
-
-        state_dict_keys = expert.expert_weights.keys()
-        for key in state_dict_keys:
-            p, ema_p = expert.expert_weights[key], ema_expert.expert_weights[key]
-            ema_p.data.mul_(ema_coef).add_(p.data, alpha=1 - ema_coef)
-
-
-@dataclass
-class KMMoEModelConfig(ExpertModelConfig, MoEModelConfig):
-    moe_num_experts: int = 8
-
-
-# For training models in a multitask setup
-@BaseExpertModel.register("moe_km", config_cls=KMMoEModelConfig)
-class KMMoEModel(BaseExpertModel, MultiExpertMixin):
-    def __init__(self, config, **kwargs):
-
-        assert config.selector_config is not None
-        assert isinstance(config.selector_config, PolySelectorConfig)
-
-        super().__init__(config, **kwargs)
-
-        for e_i in range(self.config.moe_num_experts):
-            self.add_empty_expert(f"e{e_i}", expert_config=config.modifier_config)

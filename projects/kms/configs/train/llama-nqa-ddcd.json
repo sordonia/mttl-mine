@@ -1,15 +1,13 @@
 {
     "loss_function": "dcd",
-    "dataset_type": "concat_km",
-    "max_concat_tokens": 2048,
-    "dataset": "sordonia/nqa_summaries_qa_llama-3.1-8B",
+    "dataset_type": "doc_km",
+    "dataset": "az://mttldata/narrativeqa-sanitized",
     "max_input_length": 4096,
     "eval_every_n_epoch": -1,
     "save_every": 50,
     "eval_every": 50,
     "total_steps": 1500,
     "num_train_epochs": -1,
-    "use_only_type": "summary,qa",
     "split_train_dev_on": "output",
     "lora_rank": 16,
     "lora_alpha": 16,
@@ -32,5 +30,6 @@
     "truncation_side": "left",
     "attn_implementation": "flash_attention_2",
     "evaluate_on": "nqa",
-    "task_name_field": "document_id"
+    "task_name_field": "document_id",
+    "patience": 3
 }

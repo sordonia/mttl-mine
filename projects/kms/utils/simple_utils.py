@@ -1,5 +1,7 @@
+import gc
 import json
 import os
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -14,6 +16,7 @@ from mttl.dist_utils import (
 from mttl.logging import logger
 from mttl.models.expert_model import disable_modifiers
 from mttl.models.utils import compute_loglike_loss, transfer_batch_to_device
+from mttl.utils import get_ram, get_vram, toggle_cache
 
 
 def print_metrics(data):
@@ -50,8 +53,6 @@ def print_metrics(data):
 def mc_loss(
     model,
     inputs,
-    temp=1.0,
-    iterative=False,
 ):
     """
     Multiple choice training loss, we normalize the log-likelihood of each answer,
@@ -90,6 +91,78 @@ def mc_loss(
         for i, option_losses in enumerate(loss_per_example)
     ]
     return torch.stack(loss_per_example).mean()
+
+
+def mc_loss_iterative(model, inputs, pad_token_id):
+    """
+    Multiple choice training loss, we normalize the log-likelihood of each answer,
+    and compute cross-entropy on the correct label.
+
+    Optimized to avoid redundant computation on shared prefixes in multiple choice questions.
+    """
+    import numpy as np
+    import torch
+
+    input_ids = inputs["input_ids"]
+    labels = inputs["labels"]
+    attention_mask = inputs["attention_mask"]
+    num_options = inputs["num_options"]
+    labels_index = inputs["labels_index"]
+
+    # Find the shared prefixes for each question
+    batch_size = len(num_options)
+    start_indices = np.cumsum([0] + num_options[:-1])
+
+    # Process each question group separately
+    loss_per_example = []
+
+    for i in range(batch_size):
+        options_start_idx = start_indices[i]
+        options_end_idx = options_start_idx + num_options[i]
+
+        # Get all options for this question
+        x_input_ids = input_ids[options_start_idx:options_end_idx]
+        x_attn_mask = attention_mask[options_start_idx:options_end_idx]
+        x_labels = labels[options_start_idx:options_end_idx]
+
+        option_losses = []
+        for j in range(x_input_ids.size(0)):
+
+            # At this point, we don't need padding. Removing padding
+            # will remove error when right padded input
+            outputs = model(
+                input_ids=x_input_ids[[j]],
+                attention_mask=x_attn_mask[[j]],
+                task_names=inputs.get("task_names")[
+                    options_start_idx : options_start_idx + 1
+                ],
+            )
+            loss_per_option = compute_loglike_loss(
+                outputs.logits,
+                x_labels[[j]],
+                reduction="none",
+                normalize_length=True,
+            )
+
+            option_losses += [loss_per_option]
+
+        option_losses = torch.cat(option_losses)
+        # build a distribution over all options
+        example_loss = -torch.log_softmax(-option_losses, dim=0)[labels_index[i]]
+
+        # instead of averaging later over the batch_size, we divide the loss now
+        example_loss = example_loss / batch_size
+
+        if (i + 1) == batch_size:
+            # for the last example, we don't backward, leave it to the backward
+            # call in the main file
+            loss_per_example += [example_loss]
+        else:
+            # for the other examples, we need to backward
+            example_loss.backward()
+            loss_per_example += [example_loss.detach()]
+
+    return torch.stack(loss_per_example).sum()
 
 
 def dcd_loss(
@@ -212,27 +285,36 @@ def do_evaluation(
     **kwargs,
 ) -> bool:
 
-    if evaluator is not None:
-        eval_score = evaluator.evaluate(model, split=evaluator_split, **kwargs)
-    else:
-        eval_score = None
+    state = model.training
+    model.eval()
 
     if split == "dev":
         eval_dataloader = datamodule.val_dataloader()
     else:
         eval_dataloader = datamodule.test_dataloader()
 
+    pbar = tqdm(eval_dataloader, disable=not is_main_process())
     eval_loss = []
-    for batch in tqdm(eval_dataloader, disable=not is_main_process()):
+    for batch in pbar:
         with torch.no_grad():
             batch = transfer_batch_to_device(batch, model.device)
             eval_loss.append(loss_function(model, batch).item())
             del batch
-    torch.cuda.empty_cache()
+            pbar.set_description(
+                f"Eval loss: {eval_loss[-1]:.4f}, {get_ram()}, {get_vram()}"
+            )
 
+        torch.cuda.empty_cache()
     eval_loss = distributed_mean(eval_loss, model.device)
 
+    if evaluator is not None:
+        eval_score = evaluator.evaluate(model, split=evaluator_split, **kwargs)
+    else:
+        eval_score = None
+
     torch.cuda.empty_cache()
+    model.train(state)
+
     return eval_loss, eval_score
 
 
@@ -312,3 +394,38 @@ class EarlyStopper:
             self.early_stop = True
 
         return self.early_stop
+
+
+@contextmanager
+def cpu_offload(model, names, enable=False):
+    """Swap the specified set of KMs from CPU to GPU."""
+    if enable:
+        names = set(names)
+        tmp_storage = {}
+        if hasattr(model, "experts_containers"):
+            for cid, container in enumerate(model.experts_containers):
+                for name in names:
+                    device = model.device
+                    tmp_storage[f"{cid}_{name}_lora_a"] = container.lora_a[name].data
+                    tmp_storage[f"{cid}_{name}_lora_b"] = container.lora_b[name].data
+                    container.lora_a[name].data = container.lora_a[name].data.to(device)
+                    container.lora_b[name].data = container.lora_b[name].data.to(device)
+    yield
+    if enable:
+        if hasattr(model, "experts_containers"):
+            for cid, container in enumerate(model.experts_containers):
+
+                assert (
+                    container.lora_a[name].grad is None
+                ), "should call loss.backward() under decorator"
+                assert (
+                    container.lora_b[name].grad is None
+                ), "should call loss.backward() under decorator"
+
+                for name in names:
+                    container.lora_a[name].data = tmp_storage[f"{cid}_{name}_lora_a"]
+                    container.lora_b[name].data = tmp_storage[f"{cid}_{name}_lora_b"]
+
+        del tmp_storage
+        gc.collect()
+        torch.cuda.empty_cache()

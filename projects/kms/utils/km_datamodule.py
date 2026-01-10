@@ -15,12 +15,12 @@ from mttl.logging import logger
 from mttl.models.library.dataset_library import DatasetLibrary
 
 
-def create_dcd_pairs(tokenizer, source, target, prompt):
+def create_dcd_pairs(tokenizer, source, target, prompt, apply_chat_template=True):
     """Create DCD pairs, teacher sees the source + prompt, student sees only the prompt."""
     teacher_source = source + "\n\n" + prompt
     student_source = prompt
 
-    if tokenizer.chat_template is not None:
+    if apply_chat_template:
         teacher_source = tokenizer.apply_chat_template(
             [
                 {
@@ -56,6 +56,8 @@ class KMDatasetConfig(DatasetConfig):
     task_source_field: str = "document_id"
     # for train / dev split, split by document chunk, or split the list of summary / q/a's ?
     split_train_dev_on: str = "document_chunk"
+    # use chat template if available
+    use_chat_template: bool = True
 
 
 class KMDataCollator(DefaultCollator):
@@ -171,7 +173,12 @@ class KMDatasetModule(DataModule):
                         output_str = output
 
                     context_source, no_context_source = create_dcd_pairs(
-                        self.tokenizer, input, output_str, prompt_str
+                        self.tokenizer,
+                        input,
+                        output_str,
+                        prompt_str,
+                        apply_chat_template=self.config.use_chat_template
+                        and self.tokenizer.chat_template is not None,
                     )
                     return_dict["source"].append(context_source)
                     return_dict["nc_source"].append(no_context_source)
@@ -409,7 +416,6 @@ class LMDataModule(DataModule):
 
 @dataclass
 class ConcatDatasetConfig(KMDatasetConfig):
-    n_concat: int = 2
     max_concat_tokens: int = None
     use_only_type: str = "summary"
 
@@ -471,14 +477,10 @@ class ConcatDatasetModule(KMDatasetModule):
                 len_in_tokens = [len(self.tokenizer.encode(o)) for o in concat_outputs]
                 for s_idx in range(len(outputs)):
                     # summary at index i will appear first. Now, sample `n_concat - 1` other indices
-                    other_idx = np.random.choice(
-                        [j for j in range(len(outputs)) if j != s_idx],
-                        min(self.config.n_concat, len(outputs)) - 1,
-                        replace=False,
-                    )
+                    other_idx = [j for j in range(len(outputs)) if j != s_idx]
                     # We will use the indices in `synthetic_idx` to create the synthetic data
                     synthetic_data = []
-                    synthetic_idx = [s_idx] + other_idx.tolist()
+                    synthetic_idx = [s_idx] + other_idx
                     total_tokens = 0
 
                     # let's make sure the total number of concatenated tokens is less than `max_concat_tokens`, but
@@ -498,7 +500,6 @@ class ConcatDatasetModule(KMDatasetModule):
                                 if isinstance(outputs[idx], dict)
                                 else outputs[idx]
                             )
-                            join_str = "\n\n----- New Summary -----\n\n"
                         elif example["type"][i] == "qa":
                             if isinstance(outputs[idx], dict):
                                 output_str = f"\nQuestion: {outputs[idx]['question']}\nAnswer: {outputs[idx]['answer']}"
@@ -508,7 +509,6 @@ class ConcatDatasetModule(KMDatasetModule):
                                 raise TypeError("invalid type for output")
                             prompt_str = "Generate a question-answer pair given the preceding passage."
                             synthetic_data.append(output_str)
-                            join_str = "\n\n"
                         else:
                             raise ValueError(f"Unknown type {example['type'][i]}")
 
@@ -517,9 +517,15 @@ class ConcatDatasetModule(KMDatasetModule):
                         if total_tokens > self.config.max_concat_tokens:
                             break
 
+                    join_str = "\n\n\n\n"
                     concat_data = join_str.join(synthetic_data)
                     context_source, no_context_source = create_dcd_pairs(
-                        self.tokenizer, input, concat_data, prompt_str
+                        self.tokenizer,
+                        input,
+                        concat_data,
+                        prompt_str,
+                        apply_chat_template=self.config.use_chat_template
+                        and self.tokenizer.chat_template is not None,
                     )
                     return_dict["source"].append(context_source)
                     return_dict["nc_source"].append(no_context_source)
@@ -568,11 +574,17 @@ class FullDocKMDatasetModule(DataModule):
                 prompt = f"You are given a partial document. You must predict the next token in the document. Start predicting as soon as the document starts.\n\nDocument : {doc}"
 
                 # Apply chat template
-                formatted_text = self.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": prompt}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                if (
+                    self.config.use_chat_template
+                    and self.tokenizer.chat_template is not None
+                ):
+                    formatted_text = self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": prompt}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                else:
+                    formatted_text = prompt
 
                 return_dict["source"].append(formatted_text)
                 return_dict["target"].append(doc)  # The target is the document itself

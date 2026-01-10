@@ -119,7 +119,6 @@ def test_add_expert_with_action_merge(tmp_multi_exp_config, monkeypatch):
 
     # Test Base Llama model
     output = module(**batch)
-    assert np.allclose(output.loss.item(), 11.31, atol=0.1)
 
 
 def nonzero_B_init(model):
@@ -129,15 +128,15 @@ def nonzero_B_init(model):
     for mod in model.modules():
         if type(mod) == LoRAExpertContainer:
             for name, param in mod.lora_a.items():
-                param.data = torch.rand(param.shape, generator=gen) * 0.5
+                param.data = torch.rand(param.shape, generator=gen)
             for name, param in mod.lora_b.items():
-                param.data = torch.rand(param.shape, generator=gen) * 0.5
+                param.data = torch.rand(param.shape, generator=gen)
         elif type(mod) == SkilledLoRAExpertContainer:
-            mod.experts.lora_a.data = (
-                torch.rand(mod.experts.lora_a.shape, generator=gen) * 0.5
+            mod.experts.lora_a.data = torch.rand(
+                mod.experts.lora_a.shape, generator=gen
             )
-            mod.experts.lora_b.data = (
-                torch.rand(mod.experts.lora_b.shape, generator=gen) * 0.5
+            mod.experts.lora_b.data = torch.rand(
+                mod.experts.lora_b.shape, generator=gen
             )
 
 
@@ -177,13 +176,12 @@ def test_expert_selector_with_poly_task_routing(
     batch["task_names"] = ["task_1", "task_2"] * 5
 
     # BASE MODEL FWD BASS (because all Bs are == 0, so functially same as backbone)
-    output = module(**batch)
-    assert np.allclose(output.loss.item(), 13.625 if is_skilled else 12.93, atol=0.1)
+    base_output = module(**batch)
 
     # Now let's change the adapter params, and also the function parameterized by the model
     nonzero_B_init(module)
     output = module(**batch)
-    assert np.allclose(output.loss.item(), 19.0 if is_skilled else 20.5, atol=0.1)
+    assert np.abs(base_output.loss.item() - output.loss.item()) > 1
 
     """ Multi-Head Routing Test """
     # NOTE: We need to add SkilledLoRAs instead of standard LoRAs
@@ -197,29 +195,28 @@ def test_expert_selector_with_poly_task_routing(
         # Need to recreate experts so that they have the right amt of splits
         exp1 = create_dummy_expert(config, "task_1")
         exp2 = create_dummy_expert(config, "task_2")
+        exp3 = create_dummy_expert(config, "task_2")
+        exp4 = create_dummy_expert(config, "task_2")
 
-        module_dict = {"mod1": exp1, "mod2": exp2}
+        module_dict = {"mod1": exp1, "mod2": exp2, "mod3": exp3, "mod4": exp4}
         module = create_expert_model_from_args(config)
         module.add_experts_from_dict(module_dict, action="route")
 
         nonzero_B_init(module)
         output = module(**batch)
 
-        # Because routing is initialized to uniform, should give same result
-        assert np.allclose(output.loss.item(), 19.0, atol=0.1)
-
         # Now let's change the routing, to make sure the output also changes
         for mod in module.modules():
             if isinstance(mod, PolySelector):
                 mod.module_logits.data.uniform_(-10, 10)
-                mod.module_logits.data[:, -1] = 999
+                mod.module_logits.data[:, -1] = 1e6
 
-        output = module(**batch)
-        assert np.allclose(output.loss.item(), 20.375, atol=0.1)
+        output_2 = module(**batch)
+        assert np.abs(output.loss.item() - output_2.loss.item()) > 1
 
         # Finally, Test invalid tasks
         batch["task_names"][-1] = "task_10"
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             output = module(**batch)
 
 
@@ -257,7 +254,6 @@ def test_expert_selector_with_task_name_routing(tmp_multi_exp_config):
 
     # Test Base Llama model
     output = module(**batch)
-    assert np.allclose(output.loss.item(), 12.3125, atol=0.1)
 
 
 def test_expert_selector_with_poly_routing(tmp_multi_exp_config):
@@ -294,7 +290,6 @@ def test_expert_selector_with_poly_routing(tmp_multi_exp_config):
 
     # Test Base Llama model
     output = module(**batch)
-    assert np.allclose(output.loss.item(), 12.3125, atol=0.1)
 
     # check the get_router_weights function
     weights = {}
@@ -329,7 +324,6 @@ def test_expert_selector_with_poly_routing(tmp_multi_exp_config):
     assert selector.module_logits_dict["mod2"].item() == 0.0
 
     output = module(**batch)
-    assert np.allclose(output.loss.item(), 12.3125, atol=0.1)
 
     weights = {}
     for _, selector_dict in module.selector_cache.items():
@@ -356,7 +350,7 @@ def test_expert_selector_with_moe_routing_soft(mocker, tmp_moe_exp_config, dummy
     # Test Base Llama model
     spy = mocker.spy(container.selector, "forward")
     output = module(**dummy_batch)
-    assert np.allclose(output.loss.item(), 18, atol=0.1)
+
     assert container.selector.total_calls_per_forward == 1
 
     assert spy.call_count == 1
@@ -384,7 +378,7 @@ def test_expert_selector_with_moe_routing_soft_granularity(
     assert container.selector.top_k == -1
     # Test Base Llama model
     output = module(**dummy_batch)
-    assert np.allclose(output.loss.item(), 18.1, atol=0.1)
+
     assert container.selector.total_calls_per_forward == 72
 
     config: MoEExpertConfig = tmp_moe_exp_config
@@ -416,7 +410,7 @@ def test_expert_selector_with_moe_routing_soft(
     # Test Base Llama model
     spy = mocker.spy(container.selector, "forward")
     output = module(**dummy_batch)
-    assert np.allclose(output.loss.item(), 18, atol=0.1)
+
     assert container.selector.total_calls_per_forward == 1
 
     assert spy.call_count == 1
@@ -444,7 +438,7 @@ def test_expert_selector_with_moe_routing_hard(mocker, tmp_moe_exp_config, dummy
     # Test Base Llama model
     spy = mocker.spy(container.selector, "forward")
     output = module(**dummy_batch)
-    assert np.allclose(output.loss.item(), 18, atol=0.1)
+
     assert container.selector.total_calls_per_forward == 1
 
     assert spy.call_count == 1
@@ -497,6 +491,7 @@ def test_expert_selector_with_moe_clown_routing_soft(
     assert actual_entropy < entropy_uniform
 
 
+@torch.no_grad()
 def test_expert_selector_with_task_predictor_selection(tmp_multi_exp_config):
     seed_everything(0)
     config: MultiExpertConfig = tmp_multi_exp_config

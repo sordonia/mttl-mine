@@ -1,11 +1,9 @@
-import copy
 import os
 import random
-from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 
 import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
 # register this datamodule!
@@ -28,23 +26,19 @@ from mttl.dist_utils import (
 )
 from mttl.logging import logger, setup_logging
 from mttl.models.get_optimizer import get_optimizer_and_scheduler
-from mttl.models.library.expert import load_expert
 from mttl.models.utils import transfer_batch_to_device
-from projects.kms.train_km_simple import (
-    evaluate_class,
-    evaluate_datasets,
-    evaluate_metrics,
-)
 from projects.kms.utils.longhealth_datamodule import LonghealthDatamodule
 from projects.kms.utils.longhealth_evaluator import LonghealthEvaluator
 from projects.kms.utils.quality_datamodule import QualityDatamodule
-from projects.kms.utils.quality_evaluator import QualityEvaluator
+from projects.kms.utils.quality_evaluator import GenQualityEvaluator, QualityEvaluator
 from projects.kms.utils.simple_utils import (
     EarlyStopper,
     SimpleLogger,
+    cpu_offload,
     do_evaluation,
     lm_loss,
     mc_loss,
+    mc_loss_iterative,
     print_metrics,
 )
 
@@ -53,7 +47,7 @@ from projects.kms.utils.simple_utils import (
 # import Selector before args
 from mttl.models.expert_model import ExpertModel, ExpertModelConfig
 from mttl.models.library.expert_library import ExpertLibrary
-from mttl.utils import remote_login
+from mttl.utils import get_ram, get_vram, remote_login
 from projects.kms.train_km_simple import KMArguments
 from projects.kms.utils.km_model import KEMoEModel, KEMoEModelConfig
 
@@ -70,36 +64,10 @@ class KEArguments(MultiExpertConfig, KMArguments):
     force: bool = False
     # keep on cpu
     cpu_offload: bool = False
-    #
+    # if false, we train & eval
     do_eval: bool = False
-
-
-@contextmanager
-def cpu_offload(model, names, enable=False):
-    """Swap the specified set of KMs from CPU to GPU."""
-    if enable:
-        names = set(names)
-        if isinstance(model, KEMoEModel):
-            for container in model.experts_containers:
-                for name in names:
-                    device = model.device
-                    requires_grad = container.lora_a[name].requires_grad
-                    container.lora_a[name] = container.lora_a[name].to(device)
-                    container.lora_b[name] = container.lora_b[name].to(device)
-                    container.lora_a[name].requires_grad = requires_grad
-                    container.lora_b[name].requires_grad = requires_grad
-        torch.cuda.empty_cache()
-    yield
-    if enable:
-        if isinstance(model, KEMoEModel):
-            for container in model.experts_containers:
-                for name in names:
-                    requires_grad = container.lora_a[name].requires_grad
-                    container.lora_a[name] = container.lora_a[name].to("cpu")
-                    container.lora_b[name] = container.lora_b[name].to("cpu")
-                    container.lora_a[name].requires_grad = requires_grad
-                    container.lora_b[name].requires_grad = requires_grad
-        torch.cuda.empty_cache()
+    # whether evaluator should be verbose
+    verbose: bool = False
 
 
 def train_ke(training_args):
@@ -142,6 +110,8 @@ def train_ke(training_args):
         expert_selection += datamodule.test_task_names
         eval_task_names = datamodule.test_task_names
 
+    # TODO max eval tasks  ?
+
     if training_args.do_eval:
         expert_selection = eval_task_names
     else:
@@ -159,7 +129,7 @@ def train_ke(training_args):
             library_id=training_args.library_id,
             expert_selection=expert_selection,
             selector_config=training_args.selector_config,
-            cpu_offload=training_args.cpu_offload,
+            eval_cpu_offload=training_args.cpu_offload,
         )
         model = KEMoEModel(
             model_config,
@@ -199,7 +169,14 @@ def train_ke(training_args):
         model.model.config.use_cache = False
 
     is_quality = isinstance(datamodule, QualityDatamodule)
-    loss_function = mc_loss if is_quality else lm_loss
+    if is_quality and args.cpu_offload:
+        loss_function = partial(
+            mc_loss_iterative, pad_token_id=datamodule.tokenizer.pad_token_id
+        )
+    elif is_quality:
+        loss_function = mc_loss
+    else:
+        loss_function = lm_loss
     device = get_device()
 
     if not training_args.do_eval:
@@ -231,26 +208,24 @@ def train_ke(training_args):
             early_stopper = EarlyStopper(patience=training_args.patience, mode="min")
 
         if training_args.eval_before_training:
-            with cpu_offload(model, eval_task_names, training_args.cpu_offload):
-                val_loss, eval_score = do_evaluation(
-                    datamodule,
-                    model,
-                    loss_function,
-                    evaluator=evaluator,
-                    evaluator_split=split,
-                    split=split,
-                )
+            val_loss, eval_score = do_evaluation(
+                datamodule,
+                model,
+                loss_function,
+                evaluator=evaluator,
+                evaluator_split=split,
+                split=split,
+                verbose=training_args.verbose,
+            )
             met_logger.log_metrics(
                 {"val_loss": val_loss, eval_metric: eval_score}, step=global_step
             )
 
-            logger.info(f"Validation Loss: {val_loss}, {eval_metric}: {eval_score}")
-            logger.info(
-                f"Losses so far: {print_metrics(met_logger.get_metric('val_loss'))}"
-            )
-            logger.info(
-                f"Eval so far: {print_metrics(met_logger.get_metric(eval_metric))}"
-            )
+        logger.info(f"Validation Loss: {val_loss}, {eval_metric}: {eval_score}")
+        logger.info(
+            f"Losses so far: {print_metrics(met_logger.get_metric('val_loss'))}"
+        )
+        logger.info(f"Eval so far: {print_metrics(met_logger.get_metric(eval_metric))}")
 
         # Handle "step" vs "epoch" logic for training and testing
         assert (
@@ -325,8 +300,9 @@ def train_ke(training_args):
                     f" Loss: {loss_accum:.4f},"
                     f" Norm: {norm:.4f},"
                     f" Lr: {scheduler.get_last_lr()[0]:.4f},"
-                    f" Val: {best_val:.4f} ({val_loss:.4f})"
-                    f" Mem: {torch.cuda.memory_allocated() / (1024 ** 2)}"
+                    f" Val: {best_val:.4f} ({val_loss:.4f}),"
+                    f" {get_ram()},"
+                    f" {get_vram()}"
                 )
 
             global_step += 1
@@ -343,15 +319,15 @@ def train_ke(training_args):
                 and epoch % training_args.eval_every_n_epoch == 0
             )
             if do_eval_on_step or do_eval_on_epoch:
-                with cpu_offload(model, eval_task_names, training_args.cpu_offload):
-                    val_loss, eval_score = do_evaluation(
-                        datamodule,
-                        model,
-                        loss_function,
-                        (evaluator if training_args.callback_during_training else None),
-                        evaluator_split=split,
-                        split=split,
-                    )
+                val_loss, eval_score = do_evaluation(
+                    datamodule,
+                    model,
+                    loss_function,
+                    (evaluator if training_args.callback_during_training else None),
+                    evaluator_split=split,
+                    split=split,
+                    verbose=training_args.verbose,
+                )
 
                 met_logger.log_metrics(
                     {"val_loss": val_loss, eval_metric: eval_score}, step=global_step
@@ -386,19 +362,19 @@ def train_ke(training_args):
 
     model.load_weights(training_args.output_dir + "/best_model")
 
-    with cpu_offload(model, eval_task_names, training_args.cpu_offload):
-        if is_main_process():
-            os.makedirs(training_args.output_dir + "/eval_output/", exist_ok=True)
+    if is_main_process():
+        os.makedirs(training_args.output_dir + "/eval_output/", exist_ok=True)
 
-        val_loss, eval_score = do_evaluation(
-            datamodule,
-            model,
-            loss_function,
-            evaluator,
-            evaluator_split=split,
-            split=split,
-            output_path=training_args.output_dir + "/eval_output/",
-        )
+    val_loss, eval_score = do_evaluation(
+        datamodule,
+        model,
+        loss_function,
+        evaluator,
+        evaluator_split=split,
+        split=split,
+        output_path=training_args.output_dir + "/eval_output/",
+        verbose=training_args.verbose,
+    )
 
     logger.info(f"Final Validation Loss: {val_loss}, {eval_metric}: {eval_score}")
     with open(f"{training_args.output_dir}/final_eval.json", "w") as f:
